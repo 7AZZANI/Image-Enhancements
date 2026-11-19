@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "azzani-image-enhancements"
+version = "1.0.0"
+description = "AZZANI Image Enhancements — Open-source hybrid AI + photometric image restoration, super-resolution, face recovery, and detail enhancement tool."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Azzani (7AZZANI)" }
+]
+requires-python = ">=3.10"
+keywords = [
+    "image-enhancement",
+    "super-resolution",
+    "image-restoration",
+    "denoising",
+    "deblurring",
+    "face-restoration",
+    "spandrel",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "torch>=2.3.0",
+    "torchvision>=0.18.0",
+    "spandrel>=0.4.0",
+    "opencv-python-headless>=4.8.0",
+    "pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "scipy>=1.11.0",
+    "safetensors>=0.4.0",
+    "rich>=13.0.0",
+    "huggingface-hub>=0.23.0",
+]
+
+[project.optional-dependencies]
+raw = [
+    "rawpy>=0.20.0",
+]
+onnx = [
+    "onnx>=1.16.0",
+    "onnxruntime>=1.19.0",
+]
+directml = [
+    "onnx>=1.16.0",
+    "onnxruntime-directml>=1.19.0",
+]
+generative = [
+    "diffusers>=0.30.0",
+    "transformers>=4.44.0",
+    "accelerate>=0.33.0",
+]
+video = [
+    "av>=12.0.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+azzani-enhance = "azzani_enhance.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/7AZZANI/Image-Enhancements"
+Repository = "https://github.com/7AZZANI/Image-Enhancements"
+Issues = "https://github.com/7AZZANI/Image-Enhancements/issues"
+
+[tool.setuptools.packages.find]
+include = ["azzani_enhance*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

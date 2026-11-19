@@ -1,0 +1,43 @@
+services:
+  azzani-enhance:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: azzani-image-enhancements:latest
+    container_name: azzani-enhance
+    restart: unless-stopped
+    ports:
+      - "${AZZANI_PORT:-8765}:8765"
+    environment:
+      - AZZANI_API_KEY=${AZZANI_API_KEY:-}
+      - HF_HOME=/models/hf
+      - AZZANI_CACHE_DIR=/models/cache
+    volumes:
+      - ./inbox:/data/inbox
+      - ./output:/data/output
+      - ./models:/models
+    command:
+      - "--server"
+      - "--watch"
+      - "/data/inbox"
+      - "-o"
+      - "/data/output"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8765"
+      - "--models-dir"
+      - "/models"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
