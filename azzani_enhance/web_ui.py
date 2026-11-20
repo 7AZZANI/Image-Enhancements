@@ -10,6 +10,9 @@ import math
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import webbrowser
@@ -1440,6 +1443,36 @@ def create_web_server(
     return server, state
 
 
+def _open_browser_quietly(url: str) -> None:
+    """Open the local Web UI in the user's browser without polluting CLI stderr with Snap/Chromium logs."""
+    try:
+        if sys.platform.startswith("linux"):
+            xdg = shutil.which("xdg-open")
+            if xdg:
+                subprocess.Popen(
+                    [xdg, url],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return
+        elif sys.platform == "darwin":
+            opener = shutil.which("open")
+            if opener:
+                subprocess.Popen(
+                    [opener, url],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
 def launch_web_ui(
     *,
     host: str = "127.0.0.1",
@@ -1459,7 +1492,7 @@ def launch_web_ui(
     print(f"AZZANI Image Enhancements Web UI running at: {url}")
     print("Press Ctrl+C to stop cleanly.")
     if open_browser:
-        threading.Timer(0.35, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.35, lambda: _open_browser_quietly(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

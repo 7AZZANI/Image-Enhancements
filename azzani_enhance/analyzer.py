@@ -8,6 +8,9 @@ import math
 import cv2
 import numpy as np
 
+# Minimum short side (px) for FFT motion-blur analysis; smaller images yield unreliable anisotropy.
+MIN_MOTION_ANALYSIS_SIDE = 256
+
 
 @dataclass
 class ImageDiagnostics:
@@ -185,7 +188,10 @@ def _detect_illustration_heuristic(rgb_f32: np.ndarray, gray_255: np.ndarray) ->
 def _estimate_motion_blur(gray_255: np.ndarray, noise_sigma: float = 0.0) -> tuple[float, float]:
     """Detect directional camera-shake/motion streaks via Hann-windowed 2D FFT angular transfer ratio."""
     h, w = gray_255.shape
-    if min(h, w) < 64:
+    # Below ~256px each 10-degree spectral wedge holds only a handful of FFT samples and the 8x8 JPEG grid
+    # lands inside the high-frequency ring, so anisotropy estimates are dominated by noise (false positives
+    # that previously routed tiny web images into the NAFNet deblur pass).
+    if min(h, w) < MIN_MOTION_ANALYSIS_SIDE:
         return 0.0, 0.0
 
     g = gray_255.astype(np.float32, copy=False)
@@ -318,10 +324,17 @@ def analyze_image(rgb_f32: np.ndarray) -> ImageDiagnostics:
     # Adaptive routing recommendation.
     recommended_dejpeg = blockiness >= 0.28
     recommended_denoise = noise_severity >= 0.35
-    recommended_deblur = bool(motion_score >= 0.35 and not is_illus)
+    # Spectral anisotropy alone also fires on sharp scenes with strongly oriented content (tree trunks,
+    # shelves, facades). Genuine camera shake additionally lowers overall edge acuity, so require both.
+    recommended_deblur = bool(motion_score >= 0.45 and blur_severity >= 0.30 and not is_illus)
 
-    if mean_luma < 36.0:
-        exposure_boost = float(np.clip((44.0 - mean_luma) / 36.0, 0.0, 0.75))
+    # Low mean luminance alone is not underexposure: night skies, low-key still lifes and moody foliage are
+    # dark by intent and still reach bright highlights. Only recommend brightening when the whole histogram
+    # is compressed into the shadows (no highlight anywhere near the top of the range).
+    if mean_luma < 34.0 and p99 < 65.0:
+        exposure_boost = float(
+            np.clip((34.0 - mean_luma) / 40.0, 0.0, 0.5) * np.clip((65.0 - p99) / 20.0, 0.0, 1.0)
+        )
     elif mean_luma > 76.0 and highlight_clip_pct > 4.0:
         exposure_boost = float(-np.clip((mean_luma - 72.0) / 35.0, 0.0, 0.5))
     else:

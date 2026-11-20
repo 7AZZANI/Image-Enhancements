@@ -80,6 +80,12 @@ def detect_faces_yunet(
         det_img = bgr_u8
     del det_img_needed
 
+    if hasattr(cv2, "utils") and hasattr(cv2.utils, "logging"):
+        try:
+            cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+        except Exception:
+            pass
+
     detector = cv2.FaceDetectorYN.create(
         model=str(detector_onnx_path),
         config="",
@@ -154,10 +160,13 @@ def _build_face_feather_mask(size: int = 512) -> np.ndarray:
     """Create a wide, silky-smooth elliptical feather mask guaranteed zero on outer borders."""
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
     cy, cx = (size - 1) * 0.5, (size - 1) * 0.5
-    ry, rx = size * 0.43, size * 0.40
+    # In the FFHQ-aligned frame the head spans roughly y in [40, 470] and ears sit near x ~ 120 / 390.
+    # Cover forehead, hair, ears and chin (GFPGAN renders them far better than generic SR, which turns
+    # hair into painterly brush strokes) while fading out before the crop corners.
+    ry, rx = size * 0.47, size * 0.44
     dist = np.sqrt(((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2)
-    # Wide cosine falloff from r=0.50 (weight 1.0) to r=0.98 (weight 0.0) prevents hairline seams.
-    t = np.clip((dist - 0.50) / 0.48, 0.0, 1.0)
+    # Wide cosine falloff from r=0.62 (weight 1.0) to r=1.0 (weight 0.0) prevents hairline seams.
+    t = np.clip((dist - 0.62) / 0.38, 0.0, 1.0)
     mask = 0.5 * (1.0 + np.cos(np.pi * t))
 
     # Guarantee exact 0.0 along outer margin so inverse warp never leaks borderValue.
@@ -227,8 +236,17 @@ def _laplacian_pyramid_fusion(
     return np.clip(reconstructed, 0.0, 1.0).astype(np.float32)
 
 
+# Fraction of the restored-vs-original mean LAB offset removed per channel (L*, a*, b*).
+_FACE_TONE_PULL = (0.5, 0.7, 0.7)
+
+
 def _match_face_tone(restored_crop: np.ndarray, orig_crop: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Match scene skin tone and fuse via a 4-level Laplacian pyramid for seamless portrait edges."""
+    """Gently re-align restored skin tone to the scene and fuse via a 4-level Laplacian pyramid.
+
+    Only a partial mean shift is applied in CIE LAB so the face matches the neck/ears. Contrast is
+    deliberately NOT rescaled toward the (blurry) original: crisp eyes, brows, lashes and hair strands
+    are exactly what face restoration is supposed to add.
+    """
     core = mask[:, :, 0] > 0.45
     if np.count_nonzero(core) < 64:
         return restored_crop
@@ -238,13 +256,8 @@ def _match_face_tone(restored_crop: np.ndarray, orig_crop: np.ndarray, mask: np.
 
     out_lab = res_lab.copy()
     for ch in range(3):
-        r_vals = res_lab[:, :, ch][core]
-        o_vals = ori_lab[:, :, ch][core]
-        r_mean, r_std = float(np.mean(r_vals)), float(np.std(r_vals))
-        o_mean, o_std = float(np.mean(o_vals)), float(np.std(o_vals))
-        scale = np.clip((o_std + 1e-4) / (r_std + 1e-4), 0.78, 1.30)
-        matched = (res_lab[:, :, ch] - r_mean) * (0.45 + 0.55 * scale) + (0.45 * r_mean + 0.55 * o_mean)
-        out_lab[:, :, ch] = matched
+        offset = float(np.mean(ori_lab[:, :, ch][core]) - np.mean(res_lab[:, :, ch][core]))
+        out_lab[:, :, ch] = res_lab[:, :, ch] + _FACE_TONE_PULL[ch] * offset
 
     out_lab[:, :, 0] = np.clip(out_lab[:, :, 0], 0.0, 100.0)
     out_lab[:, :, 1] = np.clip(out_lab[:, :, 1], -127.0, 127.0)
@@ -340,12 +353,20 @@ def compute_face_restoration_layer(
     force_reprobe: bool = False,
     identity_guard: float = 0.65,
     identity_stats_out: Optional[Dict[str, Any]] = None,
+    restore_source: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, Optional[np.ndarray], int]:
     """Run YuNet + GFPGANv1.4 once at full fidelity, returning (restored_canvas, face_mask, count).
 
     Because fidelity blending is linear against the base canvas, downstream live UI retuning can
     adjust face fidelity instantaneously without re-running PyTorch inference.
+
+    ``restore_source`` (same size as ``rgb_f32``) is the image faces are cropped from for GFPGAN and the
+    identity check, e.g. the cleaned input resized to the output size. Generic SR output tends to paint
+    faces and hair with brush-stroke textures that GFPGAN would otherwise inherit; seam fusion and
+    pasting still happen against ``rgb_f32`` so the face transitions into the SR canvas consistently.
     """
+    if restore_source is not None and restore_source.shape[:2] != rgb_f32.shape[:2]:
+        raise ValueError("restore_source must have the same height/width as rgb_f32")
     if pre_detected_faces is not None:
         faces = pre_detected_faces
     else:
@@ -405,21 +426,30 @@ def compute_face_restoration_layer(
             affine_roi[:, 2] = affine[:, 2] + affine[:, 0] * float(rx0) + affine[:, 1] * float(ry0)
 
             roi_canvas = np.clip(np.asarray(canvas[ry0:ry1, rx0:rx1], dtype=np.float32), 0.0, 1.0)
-            aligned_orig = cv2.warpAffine(
-                roi_canvas,
-                affine_roi,
-                (512, 512),
-                flags=cv2.INTER_CUBIC,
-                borderMode=cv2.BORDER_REFLECT_101,
-            )
-            aligned_orig = np.clip(aligned_orig, 0.0, 1.0).astype(np.float32)
 
-            restored_face, _ = engine.enhance(aligned_orig)
-            restored_face = _match_face_tone(restored_face, aligned_orig, feather_512)
+            def _align(roi: np.ndarray) -> np.ndarray:
+                warped = cv2.warpAffine(
+                    roi,
+                    affine_roi,
+                    (512, 512),
+                    flags=cv2.INTER_CUBIC,
+                    borderMode=cv2.BORDER_REFLECT_101,
+                )
+                return np.clip(warped, 0.0, 1.0).astype(np.float32)
+
+            aligned_base = _align(roi_canvas)
+            if restore_source is not None:
+                roi_src = np.clip(np.asarray(restore_source[ry0:ry1, rx0:rx1], dtype=np.float32), 0.0, 1.0)
+                aligned_src = _align(roi_src)
+            else:
+                aligned_src = aligned_base
+
+            restored_face, _ = engine.enhance(aligned_src)
+            restored_face = _match_face_tone(restored_face, aligned_base, feather_512)
 
             if sface is not None and identity_guard_clamped > 0.0:
                 restored_face, post_cos, was_guarded = _apply_sface_identity_guard(
-                    sface, aligned_orig, restored_face, identity_guard=identity_guard_clamped
+                    sface, aligned_src, restored_face, identity_guard=identity_guard_clamped
                 )
                 identity_cosines.append(post_cos)
                 if was_guarded:

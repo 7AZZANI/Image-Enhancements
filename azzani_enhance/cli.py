@@ -140,12 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deblur", choices=["auto", "on", "off"], default="auto", help="Pre-clean directional camera shake via 1x NAFNet")
     parser.add_argument("--exposure-ai", choices=["auto", "on", "off"], default="off", help="Optional neural 1x exposure pass")
 
-    parser.add_argument("--face-restore", choices=["auto", "on", "off"], default="auto", help="YuNet + GFPGANv1.4 face restoration")
+    parser.add_argument("--face-restore", choices=["auto", "on", "off"], default="auto", help="YuNet + GFPGANv1.4 face restoration (auto restores small or degraded faces)")
     parser.add_argument("--face-fidelity", type=float, default=0.78, help="Restored face blend weight [0..1] (default: 0.78)")
     parser.add_argument("--identity-guard", type=float, default=0.65, help="SFace cosine identity likeness guard [0..1] (default: 0.65, 0 = off)")
 
     parser.add_argument("--color-fix", type=float, default=0.85, help="Wavelet low-frequency color anchor [0..1]")
-    parser.add_argument("--white-balance", choices=["auto", "on", "off"], default="auto", help="Adaptive white balance mode")
+    parser.add_argument("--white-balance", choices=["auto", "on", "off"], default="auto", help="White balance: auto keeps the scene's original colours (default), on = neutral-gray balancing, off")
     parser.add_argument("--tone", type=float, default=None, help="Override Retinex shadow/highlight & contrast strength [0..1]")
     parser.add_argument("--detail", type=float, default=None, help="Override guided detail sharpening strength [0..1.5]")
     parser.add_argument("--grain", type=float, default=None, help="Override subtle natural micro-grain [0..0.02]")

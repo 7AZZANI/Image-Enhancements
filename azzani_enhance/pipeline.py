@@ -304,6 +304,90 @@ def _run_model_step(
             engine.close()
 
 
+# Minimum agreement (dB) between heavily low-passed input and output of a neural pass. Legitimate restoration
+# and SR keep coarse structure and colour essentially unchanged (typically > 30 dB); unstable models fed
+# out-of-distribution inputs (e.g. NAFNet deblur on noisy JPEG thumbnails) collapse far below this.
+MIN_PASS_LOWFREQ_PSNR_DB = 22.0
+# Exposure correction shifts brightness on purpose, so only coarse structural agreement is checked for it.
+MIN_PASS_STRUCTURE_CORR = 0.85
+
+# GFPGAN renders the face box at roughly 230px inside its 512x512 canvas, so faces below this source size gain
+# real resolution from restoration; degraded sources (blur/noise/JPEG) also benefit up to the larger limit.
+AUTO_FACE_RESTORE_MAX_SRC_PX = 256.0
+AUTO_FACE_RESTORE_MAX_DEGRADED_SRC_PX = 768.0
+
+# Primary models that already synthesize abundant high-frequency detail; post-sharpening only adds crunch.
+_DETAIL_RICH_MODELS = {"photo-pro", "photo-ultra", "photo-hq", "portrait-4x", "anime-4x"}
+
+
+def _lowpass_preview(x: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
+    """Bounded-memory, heavily low-passed preview used to compare coarse structure/colour."""
+    big = is_memmap_array(x) or (x.shape[0] * x.shape[1]) > 16_000_000
+    src = (
+        stride_preview(x, max_side=4 * max(size_wh))
+        if big
+        else np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0)
+    )
+    small = cv2.resize(src, size_wh, interpolation=cv2.INTER_AREA)
+    return cv2.GaussianBlur(small, (0, 0), sigmaX=1.0)
+
+
+def neural_pass_is_sane(
+    before: np.ndarray,
+    after: np.ndarray,
+    *,
+    tone_changing: bool = False,
+) -> tuple[bool, float]:
+    """Detect catastrophic model failures (NaN, blow-ups, garbage) by comparing coarse input vs output.
+
+    Returns ``(ok, score)`` where score is the low-frequency PSNR in dB (or the luma structure correlation
+    for passes that legitimately change tone).
+    """
+    h, w = before.shape[:2]
+    s = min(1.0, 256.0 / float(max(h, w)))
+    size = (max(8, int(round(w * s))), max(8, int(round(h * s))))
+    pb = _lowpass_preview(before, size)
+    pa = _lowpass_preview(after, size)
+    if not np.all(np.isfinite(pa)):
+        return False, 0.0
+    if tone_changing:
+        yb = pb.mean(axis=2).ravel()
+        ya = pa.mean(axis=2).ravel()
+        if float(np.std(yb)) < 1e-4 or float(np.std(ya)) < 1e-4:
+            return True, 1.0
+        corr = float(np.corrcoef(yb, ya)[0, 1])
+        return corr >= MIN_PASS_STRUCTURE_CORR, corr
+    mse = float(np.mean((pa - pb) ** 2))
+    psnr = 100.0 if mse <= 1e-12 else 10.0 * math.log10(1.0 / mse)
+    return psnr >= MIN_PASS_LOWFREQ_PSNR_DB, psnr
+
+
+def _deblur_is_safe(diag: ImageDiagnostics) -> bool:
+    """Deblurring acts like an inverse filter: on noisy or blocky inputs it amplifies artifacts."""
+    return (
+        diag.recommended_deblur
+        and not diag.is_illustration_likely
+        and diag.noise_severity < 0.45
+        and diag.jpeg_blockiness < 0.6
+    )
+
+
+def _select_faces_to_restore(
+    detected: list,
+    diag: ImageDiagnostics,
+    up_factor: float,
+) -> list:
+    """Pick faces that genuinely benefit from GFPGAN in auto mode (small and/or degraded source faces)."""
+    degraded = (
+        diag.blur_severity > 0.25
+        or diag.noise_severity > 0.45
+        or diag.jpeg_blockiness > 0.45
+    )
+    limit = AUTO_FACE_RESTORE_MAX_DEGRADED_SRC_PX if degraded else AUTO_FACE_RESTORE_MAX_SRC_PX
+    up = max(float(up_factor), 1e-3)
+    return [f for f in detected if min(f.bbox[2], f.bbox[3]) / up < limit]
+
+
 def _resolve_tone_config(
     diag: ImageDiagnostics,
     cfg: EnhancementConfig,
@@ -315,29 +399,38 @@ def _resolve_tone_config(
     elif cfg.white_balance == "on":
         wb_strength = cfg.white_balance_strength if cfg.white_balance_strength is not None else 0.50
     else:
-        wb_strength = (
-            cfg.white_balance_strength
-            if cfg.white_balance_strength is not None
-            else (0.45 * diag.color_cast_strength if diag.color_cast_strength > 0.18 else 0.0)
-        )
+        # Auto preserves the original white balance: gray-world balancing cannot tell a colour cast from
+        # intentional scene colour (sunsets, foliage, underwater, tungsten interiors) and measurably
+        # degraded natural photos. An explicit strength (CLI/UI) or white_balance="on" still applies it.
+        wb_strength = cfg.white_balance_strength if cfg.white_balance_strength is not None else 0.0
 
     if cfg.tone_strength is not None:
         tone_str = float(cfg.tone_strength)
     else:
-        dr_need = max(0.0, (62.0 - diag.dynamic_range) / 50.0)
         exp_need = abs(diag.recommended_exposure_boost)
-        clip_need = max(0.0, (diag.shadow_clip_pct + diag.highlight_clip_pct - 4.0) / 15.0)
-        tone_need = max(dr_need, exp_need, clip_need)
-        base_tone = 0.12 if primary_model else 0.25
-        tone_str = float(np.clip(base_tone + 0.55 * tone_need, 0.10, 0.72))
+        if primary_model is None:
+            # Pure photometric preset: the user asked for a tonal enhancement, keep a visible base amount.
+            dr_need = max(0.0, (62.0 - diag.dynamic_range) / 50.0)
+            clip_need = max(0.0, (diag.shadow_clip_pct + diag.highlight_clip_pct - 4.0) / 15.0)
+            tone_str = float(np.clip(0.25 + 0.55 * max(dr_need, exp_need, clip_need), 0.10, 0.72))
+        else:
+            # Neural presets preserve the photographer's tonality and only repair measurable defects:
+            # genuinely flat/hazy histograms and whole-image underexposure. Clipped shadows/highlights are
+            # not repairable by tone mapping (lifting crushed blacks just turns them milky), and low-key
+            # images are dark by intent, so neither triggers a tone change here.
+            dr_need = max(0.0, (55.0 - diag.dynamic_range) / 45.0)
+            tone_str = float(np.clip(0.6 * max(dr_need, exp_need), 0.0, 0.6))
 
     if cfg.detail_strength is not None:
         detail_str = float(cfg.detail_strength)
     else:
         if primary_model is None:
             detail_str = 0.20 if diag.is_illustration_likely else 0.36
+        elif primary_model in _DETAIL_RICH_MODELS:
+            # These models already synthesize more high-frequency energy than real photos contain.
+            detail_str = 0.03 if diag.is_illustration_likely else 0.04
         else:
-            # Neural SR already synthesizes sharp high-frequency edges; keep post-sharpening subtle.
+            # Lighter models (2x SPAN, 1x restoration) stay slightly soft; a touch of guided detail helps.
             detail_str = 0.06 if diag.is_illustration_likely else 0.12
 
     if cfg.natural_grain is not None:
@@ -402,7 +495,7 @@ def _resolve_plan(
                     primary_model = "dejpeg-1x"
                 elif diag.noise_severity >= 0.48:
                     primary_model = "denoise-1x"
-                elif diag.recommended_deblur and not diag.is_illustration_likely:
+                elif _deblur_is_safe(diag):
                     primary_model = "deblur-1x"
                 else:
                     primary_model = None
@@ -417,7 +510,7 @@ def _resolve_plan(
                 primary_model = "dejpeg-1x"
             elif diag.noise_severity >= 0.42:
                 primary_model = "denoise-1x"
-            elif diag.recommended_deblur and not diag.is_illustration_likely:
+            elif _deblur_is_safe(diag):
                 primary_model = "deblur-1x"
             elif diag.blur_severity > 0.55:
                 primary_model = "photo-fast"
@@ -460,11 +553,7 @@ def _resolve_plan(
     elif deblur_mode == "off":
         run_deblur = False
     else:
-        run_deblur = (
-            diag.recommended_deblur
-            and not diag.is_illustration_likely
-            and primary_model not in {"deblur-1x", None}
-        )
+        run_deblur = _deblur_is_safe(diag) and primary_model not in {"deblur-1x", None}
 
     if cfg.exposure_ai == "on":
         run_exp_ai = True
@@ -508,38 +597,52 @@ def prepare_enhancement_layers(
 
     current = work_rgb
     reference_clean = work_rgb
+    runtime_info = {"device": device_used, "precision": precision_used, "tile": tile_used}
+
+    def _guarded_step(
+        src: np.ndarray,
+        model_key: str,
+        label: str,
+        *,
+        tone_changing: bool = False,
+    ) -> tuple[np.ndarray, Optional[int]]:
+        """Run one neural pass; discard it (keeping ``src``) if its output diverges catastrophically."""
+        out, model_scale, dev, prec, tile = _run_model_step(
+            src, model_key, cfg, label, status_cb, engine_pool=engine_pool
+        )
+        ok, score = neural_pass_is_sane(src, out, tone_changing=tone_changing)
+        if not ok:
+            stages.append(f"rejected:{model_key}")
+            if status_cb:
+                status_cb(f"Discarded {label}: output diverged from input (score={score:.2f}); keeping previous stage")
+            return src, None
+        runtime_info.update(device=dev, precision=prec, tile=tile)
+        models_used.append(str(model_key))
+        return out, model_scale
 
     # Stage A: Optional 1x denoising, JPEG artifact pre-cleaning, directional deblurring & exposure rescue.
     if run_denoise:
-        current, _, device_used, precision_used, tile_used = _run_model_step(
-            current, "denoise-1x", cfg, "1x neural denoise", status_cb, engine_pool=engine_pool
-        )
-        stages.append("denoise-1x")
-        models_used.append("denoise-1x")
-        reference_clean = current
+        current, ran = _guarded_step(current, "denoise-1x", "1x neural denoise")
+        if ran is not None:
+            stages.append("denoise-1x")
+            reference_clean = current
 
     if run_dejpeg:
-        current, _, device_used, precision_used, tile_used = _run_model_step(
-            current, "dejpeg-1x", cfg, "1x neural de-JPEG", status_cb, engine_pool=engine_pool
-        )
-        stages.append("dejpeg-1x")
-        models_used.append("dejpeg-1x")
-        reference_clean = current
+        current, ran = _guarded_step(current, "dejpeg-1x", "1x neural de-JPEG")
+        if ran is not None:
+            stages.append("dejpeg-1x")
+            reference_clean = current
 
     if run_deblur:
-        current, _, device_used, precision_used, tile_used = _run_model_step(
-            current, "deblur-1x", cfg, "1x directional motion deblur", status_cb, engine_pool=engine_pool
-        )
-        stages.append("deblur-1x")
-        models_used.append("deblur-1x")
-        reference_clean = current
+        current, ran = _guarded_step(current, "deblur-1x", "1x directional motion deblur")
+        if ran is not None:
+            stages.append("deblur-1x")
+            reference_clean = current
 
     if run_exp_ai:
-        current, _, device_used, precision_used, tile_used = _run_model_step(
-            current, "exposure-1x", cfg, "1x neural exposure", status_cb, engine_pool=engine_pool
-        )
-        stages.append("exposure-1x")
-        models_used.append("exposure-1x")
+        current, ran = _guarded_step(current, "exposure-1x", "1x neural exposure", tone_changing=True)
+        if ran is not None:
+            stages.append("exposure-1x")
 
     # Stage B: Super-resolution or primary neural restoration.
     req_scale_x = target_w / float(src_w)
@@ -547,30 +650,26 @@ def prepare_enhancement_layers(
     req_scale = max(req_scale_x, req_scale_y)
 
     if primary_model is not None:
-        current, model_scale, device_used, precision_used, tile_used = _run_model_step(
-            current,
-            primary_model,
-            cfg,
-            f"neural enhancement ({primary_model})",
-            status_cb,
-            engine_pool=engine_pool,
+        current, model_scale = _guarded_step(
+            current, primary_model, f"neural enhancement ({primary_model})"
         )
-        stages.append(f"model:{primary_model}")
-        models_used.append(str(primary_model))
+        if model_scale is None:
+            # Model diverged on this input: fall back to clean resampling + photometric finishing.
+            primary_model = None
+        else:
+            stages.append(f"model:{primary_model}")
+            # Support >4x (e.g. 8x) via a second clean 2x pass when needed.
+            if req_scale > model_scale * 1.25:
+                extra_model = "anime-2x" if diag_before.is_illustration_likely else "photo-fast"
+                current, extra_scale = _guarded_step(
+                    current, extra_model, f"2nd-stage upscale ({extra_model})"
+                )
+                if extra_scale is not None:
+                    stages.append(f"model:{extra_model}")
 
-        # Support >4x (e.g. 8x) via a second clean 2x pass when needed.
-        if req_scale > model_scale * 1.25:
-            extra_model = "anime-2x" if diag_before.is_illustration_likely else "photo-fast"
-            current, _, device_used, precision_used, tile_used = _run_model_step(
-                current,
-                extra_model,
-                cfg,
-                f"2nd-stage upscale ({extra_model})",
-                status_cb,
-                engine_pool=engine_pool,
-            )
-            stages.append(f"model:{extra_model}")
-            models_used.append(extra_model)
+    device_used = str(runtime_info["device"])
+    precision_used = str(runtime_info["precision"])
+    tile_used = int(runtime_info["tile"])
 
     # Exact target resampling (supersampled downscale when e.g. 4x model -> 2x target).
     if current.shape[:2] != (target_h, target_w):
@@ -596,34 +695,33 @@ def prepare_enhancement_layers(
             status_cb("Checking for faces (YuNet)...")
         yunet_path, _ = ensure_model("face-detector-yunet", models_dir=cfg.models_dir, quiet=cfg.quiet)
         detected = detect_faces_yunet(current, yunet_path)
+        if detected and face_mode == "auto":
+            detected = _select_faces_to_restore(detected, diag_before, target_w / float(src_w))
         if detected:
-            should_restore = face_mode == "on"
-            if face_mode == "auto":
-                up_factor = max(target_w / float(src_w), 1e-3)
-                smallest_src_face = min(min(f.bbox[2], f.bbox[3]) / up_factor for f in detected)
-                should_restore = smallest_src_face < 180.0 or diag_before.blur_severity > 0.35
-            if should_restore:
-                if status_cb:
-                    status_cb(f"Restoring {len(detected)} face(s) via GFPGANv1.4...")
-                face_canvas, face_mask, faces_detected = compute_face_restoration_layer(
-                    current,
-                    device=cfg.device,
-                    precision=cfg.precision,
-                    models_dir=cfg.models_dir,
-                    quiet=cfg.quiet,
-                    pre_detected_faces=detected,
-                    engine_pool=engine_pool,
-                    force_reprobe=cfg.force_reprobe,
-                    identity_guard=cfg.identity_guard,
-                    identity_stats_out=id_stats,
-                )
-                if faces_detected > 0:
-                    stages.append(f"face-restore:{faces_detected}")
-                    models_used.append("face-gfpgan")
-                    if "face_identity_cosine" in id_stats:
-                        models_used.append("face-recognizer-sface")
-                    if id_stats.get("faces_guarded", 0) > 0:
-                        stages.append("face-identity-guard")
+            if status_cb:
+                status_cb(f"Restoring {len(detected)} face(s) via GFPGANv1.4...")
+            face_canvas, face_mask, faces_detected = compute_face_restoration_layer(
+                current,
+                device=cfg.device,
+                precision=cfg.precision,
+                models_dir=cfg.models_dir,
+                quiet=cfg.quiet,
+                pre_detected_faces=detected,
+                engine_pool=engine_pool,
+                force_reprobe=cfg.force_reprobe,
+                identity_guard=cfg.identity_guard,
+                identity_stats_out=id_stats,
+                # Crop faces from the cleaned, resampled input: GFPGAN restores it more naturally than the
+                # generic SR output, whose painterly hair/skin textures it would otherwise inherit.
+                restore_source=ref_resized if primary_model is not None else None,
+            )
+            if faces_detected > 0:
+                stages.append(f"face-restore:{faces_detected}")
+                models_used.append("face-gfpgan")
+                if "face_identity_cosine" in id_stats:
+                    models_used.append("face-recognizer-sface")
+                if id_stats.get("faces_guarded", 0) > 0:
+                    stages.append("face-identity-guard")
 
     out_alpha = None
     if loaded.alpha is not None:
@@ -710,12 +808,17 @@ def compose_enhancement_result(
     critic_metrics: Dict[str, Any] = {}
     if layers.primary_model is not None or cfg.halo_guard > 0.0:
         clamp_amt = float(tone_cfg.halo_guard if layers.primary_model is not None else 0.0)
+        in_w, in_h = layers.input_size
+        out_w, out_h = layers.output_size
+        upscale = max(out_w / float(max(1, in_w)), out_h / float(max(1, in_h)))
         current, critic_metrics = self_critic_refinement(
             current,
             layers.reference_clean_resized,
             clamp_strength=clamp_amt,
             focus_mask=layers.focus_mask if tone_cfg.bokeh_guard else None,
             memmap_threshold_mp=effective_photo_mp,
+            scale_hint=upscale,
+            protect_mask=layers.face_mask if faces_applied > 0 else None,
         )
         if critic_metrics.get("raw_halo_index", 0.0) > 0.08 and clamp_amt > 0.0:
             stages.append("self-critic:halo-clamp")

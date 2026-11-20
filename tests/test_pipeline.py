@@ -1576,5 +1576,335 @@ def test_benchmark_suite_metrics_leaderboard_and_deployment_artifacts(tmp_path: 
     assert "/data/inbox" in compose_txt and "--server" in compose_txt
 
 
+def test_quiet_browser_launcher_low_vram_fallback_and_wb_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import shutil
+    import subprocess
+    import webbrowser
+
+    import spandrel
+
+    from azzani_enhance.inference import RuntimeConfig, SpandrelEngine, _resolve_best_cuda_or_cpu
+    from azzani_enhance.web_ui import _open_browser_quietly
+
+    # 1. Browser launcher detaches with DEVNULL on Linux so Snap/Chromium zygote stderr never hits CLI.
+    popen_calls: list[dict] = []
+
+    def _fake_popen(cmd, **kwargs):
+        popen_calls.append({"cmd": cmd, **kwargs})
+        return None
+
+    monkeypatch.setattr("azzani_enhance.web_ui.sys.platform", "linux")
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/xdg-open" if name == "xdg-open" else None)
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    _open_browser_quietly("http://127.0.0.1:8765/")
+    assert len(popen_calls) == 1
+    assert popen_calls[0]["cmd"] == ["/usr/bin/xdg-open", "http://127.0.0.1:8765/"]
+    assert popen_calls[0]["stderr"] == subprocess.DEVNULL
+    assert popen_calls[0]["start_new_session"] is True
+
+    # Fallback when xdg-open is absent uses webbrowser.open
+    opened_urls: list[str] = []
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(webbrowser, "open", lambda u: opened_urls.append(u) or True)
+    _open_browser_quietly("http://127.0.0.1:8765/")
+    assert opened_urls == ["http://127.0.0.1:8765/"]
+
+    # 2. Tight VRAM on device='auto' safely falls back to CPU instead of crashing on load
+    assert _resolve_best_cuda_or_cpu("auto", free_gb=0.04, min_bytes=120 * 1024 * 1024) is True
+    assert _resolve_best_cuda_or_cpu("cuda", free_gb=0.04, min_bytes=120 * 1024 * 1024) is False
+
+    class _StubArch:
+        name = "Stub2x"
+
+    class _StubLoader:
+        def __init__(self, device=None):
+            pass
+
+        def load_from_file(self, _path):
+            m = torch.nn.Upsample(scale_factor=2, mode="nearest")
+            return spandrel.ImageModelDescriptor(
+                model=m,
+                state_dict={},
+                architecture=_StubArch(),
+                purpose="SR",
+                tags=[],
+                supports_half=True,
+                supports_bfloat16=False,
+                scale=2,
+                input_channels=3,
+                output_channels=3,
+                size_requirements=spandrel.SizeRequirements(minimum=16, multiple_of=1, square=False),
+                tiling=spandrel.ModelTiling.SUPPORTED,
+            )
+
+    monkeypatch.setattr("azzani_enhance.inference.ModelLoader", _StubLoader)
+    monkeypatch.setattr("azzani_enhance.inference.resolve_device", lambda _req: torch.device("cuda:0"))
+    monkeypatch.setattr("azzani_enhance.inference._get_free_device_gb", lambda _dev: 0.01)
+    monkeypatch.setattr("azzani_enhance.inference.configure_torch_backends", lambda _dev: None)
+    monkeypatch.setattr("azzani_enhance.inference.empty_device_cache", lambda _dev: None)
+
+    stub_pth = tmp_path / "low_vram_stub.pth"
+    stub_pth.write_bytes(b"stub")
+    eng = SpandrelEngine(stub_pth, runtime=RuntimeConfig(device="auto", tta=1))
+    assert eng.device.type == "cpu"
+    assert "CPU fallback" in eng.precision_note
+
+    # Tile OOM fallback at min_tile falls back cleanly to CPU with >= 256px tiles (not tiny 64px)
+    eng_oom = SpandrelEngine(stub_pth, runtime=RuntimeConfig(device="auto", tta=1, tile_size=64))
+    eng_oom.device = torch.device("cuda:0")
+    real_run_tiled = eng_oom._run_tiled
+    seen_tiles: list[tuple[str, int]] = []
+
+    def _mock_run_tiled(rgb, tile_size, overlap, progress_cb=None):
+        seen_tiles.append((eng_oom.device.type, tile_size))
+        if eng_oom.device.type == "cuda":
+            raise torch.cuda.OutOfMemoryError("mock OOM")
+        return real_run_tiled(rgb, tile_size=tile_size, overlap=overlap, progress_cb=progress_cb)
+
+    monkeypatch.setattr(eng_oom, "_run_tiled", _mock_run_tiled)
+    sample_rgb = np.zeros((32, 32, 3), dtype=np.float32)
+    out_fb, used_tile = eng_oom.enhance(sample_rgb)
+    assert out_fb.shape == (64, 64, 3)
+    assert eng_oom.device.type == "cpu"
+    assert used_tile >= 256
+    assert seen_tiles == [("cuda", 64), ("cpu", 256)]
+
+    # EnginePool promotes stale CPU-fallback entries once free GPU VRAM recovers
+    from azzani_enhance.inference import EnginePool
+
+    pool = EnginePool(max_models=2)
+    fake_free = {"gb": 0.01}
+    monkeypatch.setattr("azzani_enhance.inference._get_free_device_gb", lambda _dev: fake_free["gb"])
+    created: list[object] = []
+
+    class _PoolEng:
+        def __init__(self):
+            self.device = torch.device("cpu" if fake_free["gb"] < 1.0 else "cuda:0")
+            self.runtime = RuntimeConfig()
+            self.closed = False
+            created.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "azzani_enhance.inference.create_inference_engine",
+        lambda *_a, **_kw: _PoolEng(),
+    )
+    e1 = pool.acquire(stub_pth, runtime=RuntimeConfig(device="auto"))
+    assert e1.device.type == "cpu"
+    assert pool.acquire(stub_pth, runtime=RuntimeConfig(device="auto")) is e1
+    fake_free["gb"] = 2.5
+    e2 = pool.acquire(stub_pth, runtime=RuntimeConfig(device="auto"))
+    assert e2 is not e1 and e2.device.type == "cuda"
+    assert e1.closed is True
+    pool.clear()
+
+    # 3. White balance preserves colorful teal scene when neutral white highlights already balance
+    scene = np.zeros((100, 100, 3), dtype=np.float32)
+    scene[:] = [0.12, 0.56, 0.62]  # Vivid teal aquarium water background
+    scene[:20, :30] = [0.82, 0.82, 0.82]  # Truly neutral gray/white highlight patch (> 1%)
+    wb_out = auto_white_balance(scene, strength=0.45)
+    assert float(np.max(np.abs(wb_out - scene))) < 0.02
 
 
+
+
+
+def test_minus_one_one_models_bypass_spandrel_output_clamp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """GFPGAN-style [-1, 1] models must not lose their negative half to Spandrel's [0, 1] output clamp."""
+    import spandrel
+
+    from azzani_enhance.inference import RuntimeConfig, SpandrelEngine
+
+    class _IdentityWithAux(torch.nn.Module):
+        def forward(self, x: torch.Tensor):  # GFPGAN returns (image, intermediate_rgbs)
+            return x, []
+
+    class _StubArch:
+        name = "StubFace"
+
+    class _StubLoader:
+        def __init__(self, device=None):
+            pass
+
+        def load_from_file(self, _path):
+            return spandrel.ImageModelDescriptor(
+                model=_IdentityWithAux(),
+                state_dict={},
+                architecture=_StubArch(),
+                purpose="FaceSR",
+                tags=[],
+                supports_half=False,
+                supports_bfloat16=False,
+                scale=1,
+                input_channels=3,
+                output_channels=3,
+                size_requirements=spandrel.SizeRequirements(minimum=16),
+                call_fn=lambda model, image: model(image)[0],
+            )
+
+    monkeypatch.setattr("azzani_enhance.inference.ModelLoader", _StubLoader)
+    stub = tmp_path / "face_stub.pth"
+    stub.write_bytes(b"stub")
+    eng = SpandrelEngine(stub, runtime=RuntimeConfig(device="cpu", tile_size=0), value_range="-1_1")
+
+    ramp = np.linspace(0.0, 1.0, 64, dtype=np.float32)
+    img = np.repeat(np.repeat(ramp[None, :, None], 32, axis=0), 3, axis=2)
+    out, _ = eng.enhance(img)
+    # Before the fix every value below mid-grey collapsed to exactly 0.5 (washed-out, bleached faces).
+    assert float(out.min()) < 0.02
+    assert np.allclose(out, img, atol=1e-5)
+
+
+def test_neural_pass_sanity_guard_rejects_diverged_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    from azzani_enhance import pipeline as pipeline_mod
+    from azzani_enhance.image_io import LoadedImage
+    from azzani_enhance.pipeline import neural_pass_is_sane, prepare_enhancement_layers
+
+    chart = generate_reference_chart(96, 96)
+    up = cv2.resize(chart, (192, 192), interpolation=cv2.INTER_CUBIC)
+    assert neural_pass_is_sane(chart, chart)[0]
+    assert neural_pass_is_sane(chart, up)[0]  # SR output at a different size compares at low resolution
+    rng = np.random.default_rng(3)
+    garbage = rng.uniform(0.0, 1.0, size=up.shape).astype(np.float32)
+    assert not neural_pass_is_sane(chart, garbage)[0]
+    nan_out = up.copy()
+    nan_out[10:20, 10:20] = np.nan
+    assert not neural_pass_is_sane(chart, nan_out)[0]
+    # Exposure passes legitimately brighten: only structural agreement is required.
+    brighter = np.clip(chart * 1.6 + 0.1, 0.0, 1.0)
+    assert not neural_pass_is_sane(chart, brighter)[0]
+    assert neural_pass_is_sane(chart, brighter, tone_changing=True)[0]
+
+    # A primary model that blows up (e.g. NAFNet on a noisy thumbnail) must be discarded, not returned.
+    def _blown_up_step(rgb, model_key, cfg, label, status_cb=None, engine_pool=None):
+        h, w = rgb.shape[:2]
+        return rng.uniform(0.0, 1.0, size=(h * 2, w * 2, 3)).astype(np.float32), 2, "cpu", "fp32", 0
+
+    monkeypatch.setattr(pipeline_mod, "_run_model_step", _blown_up_step)
+    loaded = LoadedImage(chart, None, 8, "PNG", None, None, (96, 96))
+    layers = prepare_enhancement_layers(
+        loaded, EnhancementConfig(preset="fast", scale=2.0, face_restore="off", quiet=True)
+    )
+    assert "rejected:photo-fast" in layers.neural_stages
+    assert layers.primary_model is None
+    bicubic = cv2.resize(chart, (192, 192), interpolation=cv2.INTER_LANCZOS4)
+    assert compute_psnr(np.clip(bicubic, 0, 1), np.asarray(layers.sr_raw_rgb)) > 30.0
+
+
+def test_analyzer_no_false_deblur_on_thumbnails_and_low_key_exposure() -> None:
+    rng = np.random.default_rng(11)
+    # Tiny noisy web thumbnail with strongly oriented content: FFT anisotropy is meaningless at this size.
+    thumb = np.clip(
+        0.45 + 0.3 * np.sin(np.linspace(0, 40, 128, dtype=np.float32))[None, :, None]
+        + rng.normal(0.0, 0.05, (128, 128, 3)).astype(np.float32),
+        0.0,
+        1.0,
+    ).astype(np.float32)
+    d_thumb = analyze_image(thumb)
+    assert d_thumb.motion_blur_score == 0.0
+    assert d_thumb.recommended_deblur is False
+
+    # Low-key still life: dark overall but with genuine bright highlights -> exposure is intentional.
+    low_key = np.full((256, 256, 3), 0.05, dtype=np.float32)
+    low_key[100:140, 100:140] = [0.95, 0.90, 0.80]
+    assert analyze_image(low_key).recommended_exposure_boost == 0.0
+
+    # Whole histogram compressed into the shadows -> genuine underexposure.
+    under = np.clip(generate_reference_chart(256, 256) * 0.22, 0.0, 1.0)
+    assert analyze_image(under).recommended_exposure_boost > 0.25
+
+
+def test_tone_config_preserves_scene_white_balance_and_tonality() -> None:
+    from azzani_enhance.analyzer import ImageDiagnostics
+    from azzani_enhance.pipeline import _resolve_tone_config
+
+    # Strong "cast" (e.g. teal aquarium, golden hour) with crushed blacks in a low-key scene.
+    diag = analyze_image(generate_reference_chart(128, 128))
+    diag = ImageDiagnostics(
+        **{
+            **diag.to_dict(),
+            "color_cast_strength": 0.95,
+            "shadow_clip_pct": 22.0,
+            "dynamic_range": 90.0,
+            "recommended_exposure_boost": 0.0,
+        }
+    )
+    auto_cfg = _resolve_tone_config(diag, EnhancementConfig(), "photo-pro")
+    assert auto_cfg.white_balance_strength == 0.0
+    assert auto_cfg.tone_strength == 0.0
+    assert auto_cfg.detail_strength <= 0.05  # detail-rich SR models need no extra sharpening
+
+    on_cfg = _resolve_tone_config(diag, EnhancementConfig(white_balance="on"), "photo-pro")
+    assert on_cfg.white_balance_strength == pytest.approx(0.50)
+
+    # Genuinely flat/hazy histogram still gets repaired on neural presets.
+    flat = ImageDiagnostics(**{**diag.to_dict(), "dynamic_range": 25.0})
+    assert _resolve_tone_config(flat, EnhancementConfig(), "photo-pro").tone_strength > 0.3
+
+
+def test_critic_window_scales_with_upscale_and_protects_faces() -> None:
+    from azzani_enhance.color_tone import critic_window_for_scale
+
+    assert critic_window_for_scale(1.0) == 5
+    assert critic_window_for_scale(2.0) == 5
+    assert critic_window_for_scale(4.0) == 9
+
+    # Ideal crisp 4x SR edge vs the bicubic reference ramp of a slightly soft (real-camera) source edge.
+    small = cv2.GaussianBlur(
+        np.concatenate([np.full((32, 16, 3), 0.2, np.float32), np.full((32, 16, 3), 0.8, np.float32)], axis=1),
+        (0, 0),
+        1.0,
+    )
+    ref = cv2.resize(small, (128, 128), interpolation=cv2.INTER_CUBIC)
+    sharp = np.full((128, 128, 3), 0.2, dtype=np.float32)
+    sharp[:, 64:] = 0.8
+
+    fixed_win, _ = self_critic_refinement(sharp, ref, clamp_strength=1.0, scale_hint=1.0)
+    scaled_win, _ = self_critic_refinement(sharp, ref, clamp_strength=1.0, scale_hint=4.0)
+    fixed_change = float(np.mean(np.abs(fixed_win - sharp)))
+    # A 5x5 window misreads legitimate SR sharpening as overshoot and blurs it back toward bicubic.
+    assert fixed_change > 1e-3
+    assert float(np.mean(np.abs(scaled_win - sharp))) < 0.5 * fixed_change
+
+    # Genuine ringing overshoot beyond the plateau is still pulled back with the wider window.
+    halo = sharp.copy()
+    halo[:, 66:70] = 0.98
+    halo[:, 58:62] = 0.02
+    dehaloed, _ = self_critic_refinement(halo, ref, clamp_strength=1.0, scale_hint=4.0)
+    assert float(dehaloed[:, 66:70].max()) < 0.93
+    assert float(dehaloed[:, 58:62].min()) > 0.07
+
+    protect = np.zeros((128, 128, 1), dtype=np.float32)
+    protect[:, 48:80] = 1.0
+    prot_out, _ = self_critic_refinement(sharp, ref, clamp_strength=1.0, scale_hint=1.0, protect_mask=protect)
+    assert np.allclose(prot_out[:, 48:80], sharp[:, 48:80], atol=1e-6)
+
+
+def test_face_selection_and_tone_match_keep_restored_detail() -> None:
+    from azzani_enhance.analyzer import ImageDiagnostics
+    from azzani_enhance.faces import DetectedFace, _match_face_tone
+    from azzani_enhance.pipeline import _select_faces_to_restore
+
+    diag = analyze_image(generate_reference_chart(128, 128))
+    clean = ImageDiagnostics(**{**diag.to_dict(), "blur_severity": 0.05, "noise_severity": 0.0, "jpeg_blockiness": 0.0})
+    pts = np.zeros((5, 2), dtype=np.float32)
+    small = DetectedFace(bbox=(0.0, 0.0, 360.0, 400.0), confidence=0.9, landmarks_5pt=pts)  # 90px in a 4x source
+    big = DetectedFace(bbox=(0.0, 0.0, 1600.0, 1800.0), confidence=0.9, landmarks_5pt=pts)  # 400px source face
+    assert _select_faces_to_restore([small, big], clean, 4.0) == [small]
+    degraded = ImageDiagnostics(**{**clean.to_dict(), "jpeg_blockiness": 0.8})
+    assert _select_faces_to_restore([small, big], degraded, 4.0) == [small, big]
+
+    # Restored crisp detail must not be flattened toward the blurry original's contrast.
+    mask = _build_face_feather_mask(512)
+    rng = np.random.default_rng(5)
+    orig = np.full((512, 512, 3), 0.45, dtype=np.float32)
+    restored = np.clip(0.45 + rng.normal(0.0, 0.12, (512, 512, 1)).astype(np.float32), 0.0, 1.0).repeat(3, axis=2)
+    fused = _match_face_tone(restored, orig, mask)
+    core = (slice(200, 312), slice(200, 312))
+    assert float(np.std(fused[core])) > 0.85 * float(np.std(restored[core]))

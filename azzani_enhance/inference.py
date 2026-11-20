@@ -9,7 +9,7 @@ import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -190,6 +190,31 @@ def _precision_cache_key(
         return None
 
 
+def _is_oom_error(err: BaseException) -> bool:
+    return isinstance(err, torch.cuda.OutOfMemoryError) or "out of memory" in str(err).lower()
+
+
+def _first_tensor(out: Any) -> torch.Tensor:
+    """Return the image tensor from raw module outputs that may be ``(image, aux, ...)`` tuples (e.g. GFPGAN)."""
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+    return out
+
+
+def _estimate_descriptor_fp32_bytes(descriptor: ImageModelDescriptor) -> int:
+    try:
+        return int(sum(p.numel() * 4 for p in descriptor.model.parameters()))
+    except Exception:
+        return 64 * 1024 * 1024
+
+
+def _resolve_best_cuda_or_cpu(requested_device: str, free_gb: float, min_bytes: int) -> bool:
+    """Return True when device=='auto' should transparently fall back to CPU due to tight free VRAM."""
+    if requested_device.lower().strip() != "auto":
+        return False
+    return (free_gb * (1024 ** 3)) < float(max(96 * 1024 * 1024, min_bytes))
+
+
 def _probe_safe_dtype(
     descriptor: ImageModelDescriptor,
     device: torch.device,
@@ -276,6 +301,9 @@ def _probe_safe_dtype(
             save_precision_entry(cache_key, "fp16", note)
         return torch.float16, note
     except Exception as exc:
+        if _is_oom_error(exc):
+            empty_device_cache(device)
+            raise
         # Cleanly fall back to rock-solid FP32 when FP16 is unstable on this hardware/architecture.
         descriptor.model.to(device=device, dtype=torch.float32)
         empty_device_cache(device)
@@ -569,17 +597,37 @@ class SpandrelEngine:
         self.descriptor: ImageModelDescriptor = loaded
         self.descriptor.eval()
 
-        self.dtype, self.precision_note = _probe_safe_dtype(
-            self.descriptor,
-            self.device,
-            self.runtime.precision,
-            value_range=self.value_range,
-            model_id=self.model_path.name,
-            force_reprobe=bool(self.runtime.force_reprobe),
-        )
-        self.descriptor.model.to(device=self.device, dtype=self.dtype)
         self._exec_callable: Any = self.descriptor
         self._compiled = False
+        # Spandrel's ImageModelDescriptor.__call__ hard-clamps every output to [0, 1]. Models that natively
+        # operate in [-1, 1] (GFPGAN) would lose their entire negative half -> every value below mid-grey
+        # collapses to 0.5 after de-normalization (washed-out faces, bleached eyes/hair). Call the raw module.
+        self._bypass_descriptor_clamp = self.value_range == "-1_1"
+
+        est_bytes = _estimate_descriptor_fp32_bytes(self.descriptor)
+        req_dev = self.runtime.device.lower().strip()
+        if (
+            self.device.type in {"cuda", "xpu"}
+            and _resolve_best_cuda_or_cpu(req_dev, _get_free_device_gb(self.device), int(est_bytes * 0.65))
+        ):
+            self._switch_to_cpu_fallback("low free GPU VRAM")
+        else:
+            try:
+                self.dtype, self.precision_note = _probe_safe_dtype(
+                    self.descriptor,
+                    self.device,
+                    self.runtime.precision,
+                    value_range=self.value_range,
+                    model_id=self.model_path.name,
+                    force_reprobe=bool(self.runtime.force_reprobe),
+                )
+                self.descriptor.model.to(device=self.device, dtype=self.dtype)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
+                if req_dev == "auto" and self.device.type != "cpu" and _is_oom_error(err):
+                    self._switch_to_cpu_fallback("GPU VRAM full")
+                else:
+                    raise
+
         if self.runtime.backend.lower().strip() == "compile" and hasattr(torch, "compile"):
             try:
                 self._exec_callable = torch.compile(
@@ -596,6 +644,21 @@ class SpandrelEngine:
         self.input_channels = int(self.descriptor.input_channels)
         self.output_channels = int(self.descriptor.output_channels)
 
+    def _switch_to_cpu_fallback(self, reason: str) -> None:
+        old_dev = self.device
+        self._compiled = False
+        self._exec_callable = self.descriptor
+        try:
+            self.descriptor.model.to("cpu", dtype=torch.float32)
+        except Exception:
+            pass
+        empty_device_cache(old_dev)
+        gc.collect()
+        self.device = torch.device("cpu")
+        self.dtype = torch.float32
+        self.precision_note = f"fp32 (CPU fallback: {reason})"
+        configure_torch_backends(self.device)
+
     def close(self) -> None:
         """Release model weights from GPU VRAM cleanly."""
         self._exec_callable = None
@@ -605,6 +668,15 @@ class SpandrelEngine:
             pass
         empty_device_cache(self.device)
         gc.collect()
+
+    def _invoke(self, fn: Any, t_dev: torch.Tensor) -> torch.Tensor:
+        """Run one forward pass, bypassing Spandrel's [0, 1] output clamp for [-1, 1] models."""
+        if fn is self.descriptor and self._bypass_descriptor_clamp:
+            call_fn = getattr(self.descriptor, "_call_fn", None)
+            model = self.descriptor.model
+            raw = call_fn(model, t_dev) if callable(call_fn) else model(t_dev)
+            return _first_tensor(raw)
+        return _first_tensor(fn(t_dev))
 
     def _forward_single_patch(self, patch_rgb: np.ndarray) -> np.ndarray:
         """Run model (+ optional TTA) on a float32 HxWx3 [0, 1] RGB patch."""
@@ -629,13 +701,13 @@ class SpandrelEngine:
             with torch.inference_mode():
                 try:
                     fn = self._exec_callable if self._exec_callable is not None else self.descriptor
-                    out_dev = fn(t_dev)
+                    out_dev = self._invoke(fn, t_dev)
                 except Exception as err:
                     # Seamless eager fallback if torch.compile encounters dynamic graph breaks on OOM/edge shapes.
                     if self._compiled and "out of memory" not in str(err).lower():
                         self._compiled = False
                         self._exec_callable = self.descriptor
-                        out_dev = self.descriptor(t_dev)
+                        out_dev = self._invoke(self.descriptor, t_dev)
                     else:
                         raise
             out_cpu = out_dev.float().cpu()
@@ -712,9 +784,7 @@ class SpandrelEngine:
                 )
                 return out, attempt_tile
             except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
-                msg = str(err).lower()
-                is_oom = isinstance(err, torch.cuda.OutOfMemoryError) or "out of memory" in msg
-                if not is_oom or self.device.type not in {"cuda", "mps", "xpu"}:
+                if not _is_oom_error(err) or self.device.type not in {"cuda", "mps", "xpu"}:
                     raise
                 gc.collect()
                 empty_device_cache(self.device)
@@ -724,6 +794,10 @@ class SpandrelEngine:
                 else:
                     next_tile = max(min_tile, (attempt_tile // 2 // 16) * 16)
                     if next_tile >= attempt_tile:
+                        if self.runtime.device.lower().strip() == "auto":
+                            self._switch_to_cpu_fallback("GPU OOM at minimum tile")
+                            attempt_tile = max(256, min_tile)
+                            continue
                         raise RuntimeError(
                             f"{self.device.type.upper()} out of memory even at minimum tile size {attempt_tile}."
                         ) from err
@@ -809,9 +883,18 @@ class EnginePool:
         with self.lock:
             if key in self._pool and not rt.force_reprobe:
                 eng = self._pool.pop(key)
-                eng.runtime = rt  # type: ignore[attr-defined]
-                self._pool[key] = eng
-                return eng
+                stale_cpu_fallback = (
+                    getattr(eng, "device", None) is not None
+                    and eng.device.type == "cpu"  # type: ignore[attr-defined]
+                    and dev.type in {"cuda", "xpu"}
+                    and _get_free_device_gb(dev) >= 1.25
+                )
+                if stale_cpu_fallback:
+                    eng.close()  # type: ignore[attr-defined]
+                else:
+                    eng.runtime = rt  # type: ignore[attr-defined]
+                    self._pool[key] = eng
+                    return eng
 
             # Evict oldest models if cache limit reached or free GPU memory is tight (< 1.15 GB).
             while self._pool and (
@@ -820,6 +903,7 @@ class EnginePool:
             ):
                 _, evicted = self._pool.popitem(last=False)
                 evicted.close()  # type: ignore[attr-defined]
+                empty_device_cache(dev)
 
             if key in self._pool:
                 self._pool.pop(key).close()  # type: ignore[attr-defined]

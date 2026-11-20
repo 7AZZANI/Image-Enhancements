@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -168,9 +169,12 @@ def _compute_wb_gains(rgb_c: np.ndarray, strength: float) -> Optional[np.ndarray
     min_c = np.min(rgb_c, axis=2)
     sat = (max_c - min_c) / (max_c + 1e-5)
 
-    # Sample neutral-to-moderate midtones so sunsets/flowers/clipped skies don't bias gains.
-    mask = (max_c < 0.94) & (min_c > 0.04) & (sat < 0.48)
-    if np.count_nonzero(mask) < max(64, int(0.01 * rgb_c.shape[0] * rgb_c.shape[1])):
+    # First sample genuinely near-neutral grays/whites so colored skies/water/forests don't bias WB.
+    n_pix = rgb_c.shape[0] * rgb_c.shape[1]
+    mask = (max_c < 0.94) & (min_c > 0.06) & (sat < 0.24)
+    if np.count_nonzero(mask) < max(64, int(0.008 * n_pix)):
+        mask = (max_c < 0.94) & (min_c > 0.04) & (sat < 0.42)
+    if np.count_nonzero(mask) < max(64, int(0.01 * n_pix)):
         mask = (max_c < 0.97) & (min_c > 0.02)
     if np.count_nonzero(mask) < 16:
         return None
@@ -266,7 +270,10 @@ def _apply_tone_enhance_with_stats(
     haze_need = max(0.0, (p02 - 0.055) / 0.16)
     if 0.04 < raw_spread < 0.78 or (raw_spread > 0.04 and haze_need > 0.05):
         spread_need = max(0.0, (0.78 - raw_spread) / 0.65)
-        stretch_amt = float(np.clip(max(strength * spread_need, 0.55 * haze_need), 0.0, 0.72))
+        # Haze recovery scales with the requested strength (full effect from 0.35 up) so a gentle tone setting
+        # never forces a black-point stretch on high-key / pastel images that simply lack pure blacks.
+        haze_amt = 0.55 * haze_need * min(1.0, strength / 0.35)
+        stretch_amt = float(np.clip(max(strength * spread_need, haze_amt), 0.0, 0.72))
         lo = p02 * 0.85
         hi = p98 + (1.0 - p98) * 0.15
         denom = max(0.20, hi - lo)
@@ -509,15 +516,27 @@ def compute_focus_bokeh_mask(
     return focus_mm
 
 
+def critic_window_for_scale(scale_hint: float) -> int:
+    """Odd local-extrema window (HR px) spanning a full bicubic edge ramp at the given upscale factor.
+
+    A sharp SR edge legitimately exceeds the min/max of a window narrower than the bicubic ramp (~2 source
+    pixels wide), so a fixed 5x5 window at 4x clamped real sharpening back toward bicubic blur.
+    """
+    s = max(1.0, float(scale_hint))
+    return max(5, 2 * int(math.ceil(s)) + 1)
+
+
 def _critic_process_block(
     enh_blk: np.ndarray,
     ref_blk: np.ndarray,
     *,
     clamp_strength: float,
     focus_blk: Optional[np.ndarray],
+    kernel_size: int = 5,
+    protect_blk: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run halo + flat-sky critic pass on an aligned enhanced/reference block."""
-    kernel = np.ones((5, 5), np.uint8)
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
     loc_max = cv2.dilate(ref_blk, kernel)
     loc_min = cv2.erode(ref_blk, kernel)
     tol = 0.045
@@ -543,6 +562,12 @@ def _critic_process_block(
         bg_pull = 0.25 * clamp_strength * flat_bg
         out = np.clip(out * (1.0 - bg_pull) + ref_blk * bg_pull, 0.0, 1.0)
 
+        if protect_blk is not None:
+            # Restored faces carry real new detail (eyes, lashes, hair) far outside the blurry reference's
+            # local range; never clamp them back toward bicubic.
+            p3 = np.clip(protect_blk if protect_blk.ndim == 3 else protect_blk[:, :, None], 0.0, 1.0)
+            out = out + p3 * (enh_blk - out)
+
     post_err = np.maximum(0.0, out - (loc_max + tol)) + np.maximum(0.0, (loc_min - tol) - out)
     return np.clip(out, 0.0, 1.0).astype(np.float32), raw_err, post_err
 
@@ -567,16 +592,25 @@ def self_critic_refinement(
     focus_mask: Optional[np.ndarray] = None,
     memmap_threshold_mp: float = 24.0,
     force_chunked: bool = False,
+    scale_hint: float = 1.0,
+    protect_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
-    """Evaluate post-SR artifacts (ringing halos, flat-sky worms, color drift) and damp them safely."""
+    """Evaluate post-SR artifacts (ringing halos, flat-sky worms, color drift) and damp them safely.
+
+    ``scale_hint`` is the upscale factor between the reference's source and the output; it widens the
+    local-extrema window so legitimate SR edge sharpening is not mistaken for overshoot. ``protect_mask``
+    (e.g. restored faces) marks regions whose new detail must never be clamped toward the reference.
+    """
     h, w = enhanced_rgb.shape[:2]
     clamp_strength = float(np.clip(clamp_strength, 0.0, 1.0))
+    ksize = critic_window_for_scale(scale_hint)
 
     use_chunked = (
         force_chunked
         or is_memmap_array(enhanced_rgb)
         or is_memmap_array(reference_rgb)
         or (focus_mask is not None and is_memmap_array(focus_mask))
+        or (protect_mask is not None and is_memmap_array(protect_mask))
         or ((h * w) / 1_000_000.0 >= float(memmap_threshold_mp))
     )
 
@@ -594,9 +628,13 @@ def self_critic_refinement(
         f_use = focus_mask
         if f_use is not None and f_use.shape[:2] != (h, w):
             f_use = cv2.resize(f_use.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)[:, :, None]
+        p_use = protect_mask
+        if p_use is not None and p_use.shape[:2] != (h, w):
+            p_use = cv2.resize(np.asarray(p_use, dtype=np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
 
         out, raw_err, post_err = _critic_process_block(
-            enh, ref_up, clamp_strength=clamp_strength, focus_blk=f_use
+            enh, ref_up, clamp_strength=clamp_strength, focus_blk=f_use, kernel_size=ksize,
+            protect_blk=None if p_use is None else np.asarray(p_use, dtype=np.float32),
         )
         raw_halo_index = float(np.clip(np.mean(raw_err) / 0.025, 0.0, 1.0))
         post_halo_index = float(np.clip(np.mean(post_err) / 0.025, 0.0, 1.0))
@@ -610,8 +648,13 @@ def self_critic_refinement(
             if focus_mask is not None
             else None
         )
+        p_x_map = (
+            (np.arange(w, dtype=np.float32) + 0.5) * (protect_mask.shape[1] / float(w)) - 0.5
+            if protect_mask is not None
+            else None
+        )
         strip_h = 512 if w < 10000 else 256
-        pad = 12
+        pad = max(12, ksize)
         raw_sum = 0.0
         post_sum = 0.0
         focus_above = 0
@@ -639,9 +682,18 @@ def self_critic_refinement(
                     )
                 if f_blk.ndim == 2:
                     f_blk = f_blk[:, :, None]
+            p_blk = None
+            if protect_mask is not None:
+                if protect_mask.shape[:2] == (h, w):
+                    p_blk = np.asarray(protect_mask[py0:py1], dtype=np.float32)
+                else:
+                    p_blk = extract_resized_strip(
+                        protect_mask, h, w, py0, py1, interpolation=cv2.INTER_LINEAR, x_map=p_x_map
+                    )
 
             out_blk, raw_blk, post_blk = _critic_process_block(
-                enh_blk, ref_blk, clamp_strength=clamp_strength, focus_blk=f_blk
+                enh_blk, ref_blk, clamp_strength=clamp_strength, focus_blk=f_blk, kernel_size=ksize,
+                protect_blk=p_blk,
             )
             iy0 = y0 - py0
             iy1 = iy0 + (y1 - y0)
